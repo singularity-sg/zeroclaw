@@ -556,6 +556,18 @@ impl WhatsAppWebChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Mirror TelegramChannel: when exactly one provider registers,
+                // auto-bind it so `transcribe()` dispatches instead of bailing
+                // on an empty agent alias. Multi-provider selection still
+                // requires an explicit orchestrator bind (not yet wired for
+                // this channel).
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
                 self.transcription = Some(config);
             }
@@ -4710,6 +4722,59 @@ mod tests {
         .with_transcription(tc);
         assert!(ch.transcription.is_none());
         assert!(ch.transcription_manager.is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_with_transcription_binds_sole_provider_alias() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+
+        // Only the Groq key is set -> exactly one provider registers.
+        // Mirrors telegram_with_transcription_binds_sole_provider_alias.
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test-groq-key".to_string()),
+            ..zeroclaw_config::schema::TranscriptionConfig::default()
+        };
+        let mention_only = false;
+        let self_chat_mode = false;
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            mention_only,
+            self_chat_mode,
+            ..Default::default()
+        };
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
+        )
+        .with_transcription(tc);
+
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("single configured provider must build a transcription manager");
+
+        // Alias is bound for the single-provider case. Stop before any network
+        // call by using an unsupported audio format, which `validate_audio`
+        // rejects first inside the provider's `transcribe`.
+        let err = manager
+            .transcribe(&[0u8; 16], "voice.aac")
+            .await
+            .expect_err("unsupported format must error before any network call");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no transcription_provider configured"),
+            "alias must be bound for the single-provider case; got: {msg}"
+        );
+        assert!(
+            msg.contains("Unsupported audio format"),
+            "expected the bound provider to reach audio validation; got: {msg}"
+        );
     }
 
     #[test]
