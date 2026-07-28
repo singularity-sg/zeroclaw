@@ -6199,6 +6199,70 @@ async fn process_channel_message_body(
         msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
     }
 
+    // ── Document attachments: save Unknown (non-Audio/Image/Video) attachments ──
+    // to the workspace and add a file path marker so the agent can read them.
+    let doc_attachments: Vec<_> = msg
+        .attachments
+        .iter()
+        .filter(|a| a.kind() == media_pipeline::MediaKind::Unknown)
+        .cloned()
+        .collect();
+    if !doc_attachments.is_empty() {
+        let docs_dir = ctx.workspace_dir.join("inbound-documents");
+        if let Err(e) = std::fs::create_dir_all(&docs_dir) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to create inbound-documents directory"
+            );
+        } else {
+            let mut doc_markers = Vec::new();
+            for attachment in &doc_attachments {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let safe_name = format!("{}_{}", ts, attachment.file_name);
+                let doc_path = docs_dir.join(&safe_name);
+                match std::fs::write(&doc_path, &attachment.data) {
+                    Ok(_) => {
+                        doc_markers.push(format!(
+                            "[Document: {}]",
+                            doc_path.display()
+                        ));
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"path": format!("{}", doc_path.display()), "size": attachment.data.len()})),
+                            "saved inbound document attachment"
+                        );
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"file": attachment.file_name, "error": format!("{}", e)})),
+                            "failed to save inbound document attachment"
+                        );
+                    }
+                }
+            }
+            if !doc_markers.is_empty() {
+                // Prepend document markers before the existing content so the
+                // agent sees them first.
+                let prefix = doc_markers.join("\n");
+                if msg.content.is_empty() {
+                    msg.content = prefix;
+                } else {
+                    msg.content = format!("{}\n\n{}", prefix, msg.content);
+                }
+            }
+        }
+    }
+
     // ── Link enricher: prepend URL summaries before agent sees the message ──
     let le_config = &ctx.prompt_config.link_enricher;
     if le_config.enabled {
