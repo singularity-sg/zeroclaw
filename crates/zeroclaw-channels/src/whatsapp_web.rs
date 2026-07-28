@@ -1594,6 +1594,33 @@ impl WhatsAppWebChannel {
             )
             .await;
         }
+
+        if let Some(ref doc) = base.document_message {
+            let mime = doc
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let doc_file_name = doc
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("{file_prefix}whatsapp-document"));
+            let file_name = if doc.file_name.is_some() {
+                doc_file_name
+            } else {
+                format!(
+                    "{file_prefix}whatsapp-document.{}",
+                    Self::mime_extension(&mime, "bin")
+                )
+            };
+            Self::push_downloaded_attachment(
+                client,
+                doc.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
     }
 
     #[cfg(feature = "whatsapp-web")]
