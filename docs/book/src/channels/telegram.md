@@ -216,6 +216,24 @@ running channel would read. For a valid alias it creates or updates
 `[peer_groups.telegram_<alias>]`, scopes the group to
 `telegram.<alias>`, and saves the identity idempotently.
 
+## Incoming media
+
+Photos and documents are downloaded to the agent workspace under
+`<workspace>/telegram_files/` and surfaced to the agent with an `[IMAGE:path]`
+or `[Document: ...]` marker.
+
+Video clips are supported too:
+
+- Both regular videos (the `video` field) and round video notes (the
+  `video_note` field) are recognized, downloaded, and saved under
+  `<workspace>/telegram_files/`.
+- The message content carries an actionable `[VIDEO:path]` marker so the clip
+  path stays available to the agent and survives multimodal routing.
+- When `media_pipeline` `summarize_video` is enabled, small clips
+  (`<= 20 MiB`) are additionally passed to the media pipeline as base64 video
+  bytes in a `[VIDEO:data:...;base64,...]` marker so a multimodal model can
+  parse the clip. Larger clips fall back to an attachment annotation.
+
 ## Restart and persistence behavior
 
 | Change | When the running channel sees it |
