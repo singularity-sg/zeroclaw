@@ -2443,6 +2443,22 @@ fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
     ))
 }
 
+/// Decide whether a WhatsApp reply is substantive enough to be voiced in
+/// strict-mirror mode (voice in → voice note only). Tool/status output is
+/// excluded so errors and progress stay visible as text; only natural-language
+/// answers are promoted to a voice-only reply.
+#[cfg(feature = "whatsapp-web")]
+fn is_substantive_voice_reply(content: &str) -> bool {
+    content.len() > 40
+        && !content.starts_with("http")
+        && !content.starts_with('{')
+        && !content.starts_with('[')
+        && !content.starts_with("Error")
+        && !content.contains("```")
+        && !content.contains("tool_call")
+        && !content.contains("wttr.in")
+}
+
 #[cfg(feature = "whatsapp-web")]
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2513,30 +2529,31 @@ impl Channel for WhatsAppWebChannel {
             .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Only substantive messages (not tool outputs) are queued.
+        // Voice chat mode: a substantive natural-language reply is queued as a
+        // voice note and the text send is skipped (strict mirror — voice in,
+        // voice out). Only substantive messages (not tool outputs) are queued.
         // A debounce task waits 10s after the last substantive message, then
-        // sends ONE voice note. Text in → text out. Voice in → text + voice out.
+        // sends ONE voice note. Text in → text out. Voice in → voice note only.
         let is_voice_chat = self
             .voice_chats
             .lock()
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
+        // Strict-mirror flag: when the last incoming message was a voice note and
+        // TTS is available, the substantive answer is delivered as a voice note
+        // only. Non-substantive output (tool progress, errors) still goes as text.
+        let mut voice_only_delivery = false;
+
         if is_voice_chat && let Some(tts_manager) = self.tts_manager.clone() {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let is_substantive = is_substantive_voice_reply(content);
 
             if is_substantive {
+                // The voice note is the sole reply — skip the text send below.
+                voice_only_delivery = true;
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
@@ -2602,7 +2619,8 @@ impl Channel for WhatsAppWebChannel {
                     }
                 });
             }
-            // Fall through to send text normally (voice chat gets BOTH)
+            // Non-substantive output (tool progress, errors) falls through to
+            // text; substantive answers skip it via voice_only_delivery.
         }
 
         let mut delivered_markers = 0usize;
@@ -2696,6 +2714,13 @@ impl Channel for WhatsAppWebChannel {
         }
 
         if !markers.is_empty() && text_content.is_empty() && delivered_markers > 0 {
+            return Ok(());
+        }
+
+        // Voice-only delivery (strict mirror): the substantive answer was queued
+        // as a voice note by the debounce task, so skip the text send — the voice
+        // note is the sole reply. Attachments/markers were already delivered.
+        if voice_only_delivery {
             return Ok(());
         }
 
@@ -3502,6 +3527,34 @@ mod tests {
     fn allowed_groups_empty_permits_all() {
         // Empty list is the default: every group passes (no behavior change).
         assert!(super::is_group_chat_allowed("123456789012345@g.us", &[]));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn substantive_voice_reply_classifies_natural_language_answers() {
+        // Long natural-language answers are eligible for voice-only delivery.
+        assert!(is_substantive_voice_reply(
+            "Here is a detailed summary of the market today across the three \
+             main sectors we track, with the key numbers you asked about."
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn substantive_voice_reply_excludes_tool_and_status_output() {
+        // Tool outputs / status lines must stay text so errors stay visible.
+        for non_voice in [
+            "short",
+            "https://example.com/longer/url/that/exceeds/the/length/limit/for/sure",
+            "{\"json\": \"payload\"}",
+            "[tool_call] some tool invocation",
+            "Error: the upstream service failed to respond after retrying",
+        ] {
+            assert!(
+                !is_substantive_voice_reply(non_voice),
+                "expected non-voice: {non_voice}"
+            );
+        }
     }
 
     #[test]
