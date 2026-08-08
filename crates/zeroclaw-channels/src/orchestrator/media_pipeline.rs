@@ -165,10 +165,23 @@ impl<'a> MediaPipeline<'a> {
     }
 
     /// Summarize a video attachment.
-    /// Video analysis requires external APIs not currently integrated.
-    /// For now we add a placeholder annotation.
+    ///
+    /// Small videos (at or below [`MAX_VIDEO_BASE64_BYTES`]) are inlined as
+    /// base64 video bytes in a `[VIDEO:data:...;base64,...]` marker so a
+    /// multimodal provider can parse the clip directly. Larger videos are too
+    /// big to inline safely and fall back to a plain attachment annotation;
+    /// the file is still saved by the channel that received it.
     fn process_video(&self, attachment: &MediaAttachment) -> String {
-        format!("[Video: {} attached]", attachment.file_name)
+        if attachment.data.len() > MAX_VIDEO_BASE64_BYTES {
+            return format!("[Video: {} attached]", attachment.file_name);
+        }
+
+        let (mime, data) = video_payload_for_multimodal(attachment);
+        let b64 = STANDARD.encode(data.as_ref());
+        format!(
+            "[Video: {} attached, will be processed by multimodal]\n[VIDEO:data:{};base64,{}]",
+            attachment.file_name, mime, b64
+        )
     }
 }
 
@@ -182,6 +195,23 @@ fn remove_last_channel_image_marker(text: &str, target: &str) -> String {
     cleaned.push_str(&text[..start]);
     cleaned.push_str(&text[end..]);
     cleaned
+}
+
+/// Maximum raw video size (bytes) that is safe to inline base64 into message
+/// content for a multimodal provider. 20 MiB is the Telegram file-download cap
+/// for bots and keeps the encoded payload bounded.
+const MAX_VIDEO_BASE64_BYTES: usize = 20 * 1024 * 1024;
+
+/// Resolve the MIME type and payload for a video attachment, defaulting to
+/// `video/mp4` when the type is unknown.
+fn video_payload_for_multimodal(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
+    let mime = attachment
+        .mime_type
+        .as_deref()
+        .filter(|m| m.to_ascii_lowercase().starts_with("video/"))
+        .unwrap_or("video/mp4")
+        .to_string();
+    (mime, Cow::Borrowed(&attachment.data))
 }
 
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
@@ -680,8 +710,72 @@ mod tests {
 
         let result = pipeline.process("watch", &[sample_video()]).await;
         assert!(
-            result.contains("[Video: clip.mp4 attached]"),
+            result.contains("[Video: clip.mp4 attached"),
             "expected video annotation, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_video_is_inlined_as_base64_for_multimodal() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false);
+
+        // A video below the 20MB base64 threshold.
+        let video = MediaAttachment {
+            file_name: "clip.mp4".to_string(),
+            data: b"\x00\x00\x00 ftypmp42 video-bytes".to_vec(),
+            mime_type: Some("video/mp4".to_string()),
+        };
+        let result = pipeline.process("look", &[video]).await;
+
+        assert!(
+            result.contains("[Video: clip.mp4 attached"),
+            "expected named annotation, got: {result}"
+        );
+        assert!(
+            result.contains("[VIDEO:data:video/mp4;base64,"),
+            "expected base64 video data URI, got: {result}"
+        );
+        assert!(result.contains("look"), "missing original text");
+    }
+
+    #[tokio::test]
+    async fn large_video_is_not_inlined_as_base64() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false);
+
+        // A video above the 20MB threshold must not be dumped into content.
+        let video = MediaAttachment {
+            file_name: "big.mp4".to_string(),
+            data: vec![0u8; 21 * 1024 * 1024],
+            mime_type: Some("video/mp4".to_string()),
+        };
+        let result = pipeline.process("watch", &[video]).await;
+
+        assert!(
+            result.contains("[Video: big.mp4 attached]"),
+            "expected fallback annotation, got: {result}"
+        );
+        assert!(
+            !result.contains("[VIDEO:data:"),
+            "large video must not be inlined as base64, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_without_mime_falls_back_to_video_mp4() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false);
+
+        let video = MediaAttachment {
+            file_name: "note.mp4".to_string(),
+            data: b"video-bytes".to_vec(),
+            mime_type: None,
+        };
+        let result = pipeline.process("watch", &[video]).await;
+        assert!(
+            result.contains("[VIDEO:data:video/mp4;base64,"),
+            "expected video/mp4 fallback mime, got: {result}"
         );
     }
 
@@ -711,7 +805,7 @@ mod tests {
             "missing image annotation"
         );
         assert!(
-            result.contains("[Video: clip.mp4 attached]"),
+            result.contains("[Video: clip.mp4 attached"),
             "missing video annotation"
         );
         assert!(result.contains("context"), "missing original text");

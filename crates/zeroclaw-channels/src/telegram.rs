@@ -31,11 +31,12 @@ struct IncomingAttachment {
     kind: IncomingAttachmentKind,
 }
 
-/// The kind of incoming attachment (document vs photo).
+/// The kind of incoming attachment (document, photo, or video).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
+    Video,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Telegram Bot API allows at most 100 commands via setMyCommands.
@@ -420,6 +421,16 @@ fn format_attachment_content(
     attachment: &zeroclaw_api::media::MediaAttachment,
     local_path: &Path,
 ) -> String {
+// Videos are surfaced with an actionable `[VIDEO:path]` marker so the
+    // clip path survives vision/multimodal routing and stays exempt from leak
+    // detection, mirroring how `[IMAGE:path]` works for photos.
+    if attachment.kind() == zeroclaw_api::media::MediaKind::Video {
+        return format!(
+            "[Video: {}]\n[VIDEO:{}]",
+            attachment.file_name,
+            local_path.display()
+        );
+    }
     match attachment_marker_kind(attachment) {
         zeroclaw_api::media::MarkerKind::Image => format!("[IMAGE:{}]", local_path.display()),
         _ => format!(
@@ -2079,8 +2090,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some((file_id, duration))
     }
 
-    /// Extract attachment metadata from an incoming Telegram message (document or photo).
-    /// Returns `None` for text-only, voice, and other unsupported message types.
+    /// Extract attachment metadata from an incoming Telegram message
+    /// (document, photo, or video). Returns `None` for text-only, voice, and
+    /// other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         // Try document first
         if let Some(doc) = message.get("document") {
@@ -2124,6 +2136,37 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 caption,
                 mime_type: None,
                 kind: IncomingAttachmentKind::Photo,
+            });
+        }
+
+        // Try video (plain video) then video_note (round video clip).
+        // `video_note` carries no file_name; both are video clips.
+        for field in ["video", "video_note"] {
+            let Some(vid) = message.get(field) else {
+                continue;
+            };
+            let file_id = vid.get("file_id")?.as_str()?.to_string();
+            let file_name = vid
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let file_size = vid.get("file_size").and_then(serde_json::Value::as_u64);
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let mime_type = vid
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+                .or_else(|| Some("video/mp4".to_string()));
+            return Some(IncomingAttachment {
+                file_id,
+                file_name,
+                file_size,
+                caption,
+                kind: IncomingAttachmentKind::Video,
+                mime_type,
             });
         }
 
@@ -2279,9 +2322,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let local_filename = match &attachment.file_name {
             Some(name) => name.clone(),
             None => {
-                // For photos, derive extension from Telegram file path
-                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                format!("photo_{chat_id}_{message_id}.{ext}")
+                // Derive extension from the Telegram file path; fall back to a
+                // per-kind default (jpg for photos, mp4 for videos).
+                let default_ext = match attachment.kind {
+                    IncomingAttachmentKind::Video => "mp4",
+                    _ => "jpg",
+                };
+                let prefix = match attachment.kind {
+                    IncomingAttachmentKind::Video => "video",
+                    _ => "photo",
+                };
+                let ext = tg_file_path
+                    .rsplit('.')
+                    .next()
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or(default_ext);
+                format!("{prefix}_{chat_id}_{message_id}.{ext}")
             }
         };
 
@@ -9461,6 +9517,62 @@ mod tests {
             }
         });
         assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_detects_video() {
+        let message = serde_json::json!({
+            "video": {
+                "file_id": "BAACAgIAAxk",
+                "file_name": "clip.mp4",
+                "file_size": 5000000,
+                "mime_type": "video/mp4",
+                "width": 1280,
+                "height": 720,
+                "duration": 15
+            },
+            "caption": "watch this"
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_id, "BAACAgIAAxk");
+        assert_eq!(att.file_name.as_deref(), Some("clip.mp4"));
+        assert_eq!(att.file_size, Some(5000000));
+        assert_eq!(att.caption.as_deref(), Some("watch this"));
+    }
+
+    #[test]
+    fn parse_attachment_metadata_detects_video_note() {
+        // Round video clips arrive as `video_note` without a file_name.
+        let message = serde_json::json!({
+            "video_note": {
+                "file_id": "BAACAgIAAxk_note",
+                "file_size": 3000000,
+                "length": 480,
+                "duration": 8
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_id, "BAACAgIAAxk_note");
+        assert_eq!(att.file_size, Some(3000000));
+        assert!(att.file_name.is_none());
+        assert!(att.caption.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_video_without_optional_fields() {
+        let message = serde_json::json!({
+            "video": {
+                "file_id": "raw_video_id"
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_id, "raw_video_id");
+        assert!(att.file_name.is_none());
+        assert!(att.file_size.is_none());
+        assert!(att.caption.is_none());
     }
 
     #[test]
