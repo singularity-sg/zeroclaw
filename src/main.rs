@@ -5124,7 +5124,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
             }
-            let effective_memory_backend = config.resolve_active_storage().kind();
+            let effective_memory_backend = config
+                .resolved_runtime_agent_alias()
+                .map(|alias| config.effective_memory_backend(alias))
+                .unwrap_or_else(|| config.resolve_active_storage().kind().to_string());
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -5145,7 +5148,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let memory_backend = effective_memory_backend;
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {
