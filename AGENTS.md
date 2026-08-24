@@ -61,6 +61,33 @@ cargo test
 
 Use `./dev/ci.sh all` for full pre-PR validation when the scope warrants it. Docs-only changes use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`. Bootstrap script changes add `bash -n install.sh`.
 
+## Local Service Rebuild & Restart
+
+The user runs the agent as a macOS LaunchAgent (`com.zeroclaw.daemon`, plist at `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`). It executes `~/.cargo/bin/zeroclaw daemon`. To rebuild and redeploy:
+
+```bash
+cargo build --release          # produces target/release/zeroclaw
+```
+
+Then, in this order — **stop the daemon before overwriting the binary**:
+
+```bash
+# Stop. The installed ~/.cargo/bin/zeroclaw may itself be the broken target,
+# so drive the service from the repo binary or launchctl directly:
+./target/release/zeroclaw service stop
+# ...or: launchctl bootout gui/$(id -u)/com.zeroclaw.daemon
+# Verify no daemon remains: ps aux | grep -i "zeroclaw daemon"
+
+cp target/release/zeroclaw ~/.cargo/bin/zeroclaw   # replace binary
+zeroclaw service start                              # restart service
+zeroclaw service status                             # expect ✅ running/loaded
+```
+
+Gotcha: overwriting the live daemon's binary in place leaves the installed
+path failing new invocations with SIGKILL (exit 137) — copy to a temp name
+first to confirm the bytes are good, and always stop the daemon before
+`cp` over `~/.cargo/bin/zeroclaw`.
+
 ## Task References
 
 The architecture map routes task-specific documentation. Consult `docs/book/src/contributing/agent-guidelines.md` only for detailed agent examples, risk and stability policy, skill discovery, and protected operational documents. Do not skip a required contract because it is no longer embedded in this bootstrap file.
