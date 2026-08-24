@@ -861,9 +861,72 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     })
 }
 
+/// Resolve an outgoing local attachment target to an absolute on-disk path,
+/// bounded to `workspace_dir`.
+///
+/// Parity with the WhatsApp, Matrix, Lark and Slack channels: absolute targets
+/// are used verbatim, `/workspace/...` container paths and workspace-relative
+/// targets (the common form the agent emits, relative to its shell CWD) join
+/// `workspace_dir`, and the resolved path must canonicalize inside
+/// `workspace_dir` (the trust boundary). With no `workspace_dir` configured the
+/// target is used verbatim (legacy daemon-CWD-relative behavior).
+///
+/// This is what the channel was missing: it only recognized HTTP URLs and
+/// absolute (or `/workspace/...`) paths, so a relative marker like
+/// `[DOCUMENT:workspace/report.pdf]` was checked against the daemon process CWD
+/// and always failed with "path not found".
+fn resolve_outgoing_local_target(
+    target: &str,
+    workspace_dir: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    let Some(ws) = workspace_dir else {
+        return Ok(target.to_string());
+    };
+
+    let workspace_canon = std::fs::canonicalize(ws).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "canonicalize Telegram workspace {} failed: {err}",
+            ws.display()
+        ))
+    })?;
+
+    let raw = std::path::Path::new(target);
+    let candidate = if let Some(rel) = target.strip_prefix("/workspace/") {
+        workspace_canon.join(rel)
+    } else if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_canon.join(raw)
+    };
+
+    let candidate_canon = match std::fs::canonicalize(&candidate) {
+        Ok(p) => p,
+        Err(_) => anyhow::bail!("Telegram attachment path not found: {target}"),
+    };
+
+    if !candidate_canon.starts_with(&workspace_canon) {
+        anyhow::bail!("Telegram attachment path escapes workspace_dir: {target}");
+    }
+
+    Ok(candidate_canon.to_string_lossy().to_string())
+}
+
 /// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
     crate::orchestrator::strip_tool_call_tags(message)
+}
+
+/// True when a reply is substantive natural language worth voicing —
+/// not a URL, JSON, code block, error, or short status line.
+fn is_substantive_voice_reply(content: &str) -> bool {
+    content.len() > 40
+        && !content.starts_with("http")
+        && !content.starts_with('{')
+        && !content.starts_with('[')
+        && !content.starts_with("Error")
+        && !content.contains("```")
+        && !content.contains("tool_call")
+        && !content.contains("wttr.in")
 }
 
 fn find_matching_close(s: &str) -> Option<usize> {
@@ -6250,22 +6313,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return Ok(());
         }
 
-        // Remap Docker container workspace path (/workspace/...) to the host
-        // workspace directory so files written by the containerised runtime
-        // can be found and sent by the host-side Telegram sender.
-        let remapped;
-        let target = if let Some(rel) = target.strip_prefix("/workspace/") {
-            if let Some(ws) = &self.workspace_dir {
-                remapped = ws.join(rel);
-                remapped.to_str().unwrap_or(target)
-            } else {
-                target
+        // Resolve the target against the channel's workspace (the bound
+        // agent's workspace dir). Absolute targets are used verbatim,
+        // `/workspace/...` container and workspace-relative targets join the
+        // workspace, all under an escape guard — so a marker like
+        // `[DOCUMENT:workspace/report.pdf]` (relative to the agent shell CWD)
+        // resolves instead of failing against the daemon's CWD.
+        let resolved = resolve_outgoing_local_target(target, self.workspace_dir.as_deref());
+        let resolved = match resolved {
+            Ok(p) => p,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"target": target, "error": format!("{}", e)})
+                        ),
+                    "Telegram attachment path resolution failed"
+                );
+                anyhow::bail!("Telegram attachment path not found: {target}");
             }
-        } else {
-            target
         };
 
-        let path = Path::new(target);
+        let path = Path::new(&resolved);
         if !path.exists() {
             anyhow::bail!("Telegram attachment path not found: {target}");
         }
@@ -9095,6 +9166,7 @@ mod tests {
                 ..Default::default()
             },
         );
+
 
         let ch = TelegramChannel::new(
             "fake-token".into(),
@@ -16189,6 +16261,83 @@ mod tests {
 
         // Should not panic
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn telegram_send_attachment_resolves_workspace_relative_document() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ws = tempfile::tempdir().expect("tempdir");
+        let reports = ws.path().join("reports");
+        std::fs::create_dir_all(&reports).expect("make reports dir");
+        let file = reports.join("itinerary.pdf");
+        std::fs::write(&file, b"%PDF-1.4 test").expect("write fixture pe");
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(ws.path().to_path_buf());
+
+        // A workspace-relative marker target (`[DOCUMENT:reports/itinerary.pdf]`)
+        // must resolve against the channel workspace rather than the daemon CWD.
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: "reports/itinerary.pdf".to_string(),
+        };
+        let result = ch.send_attachment("123456", None, &attachment).await;
+        assert!(
+            result.is_ok(),
+            "workspace-relative document must resolve and send, got: {}",
+            result.unwrap_err()
+        );
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn telegram_send_attachment_refuses_target_escaping_workspace() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outer_file = outside.path().join("sneak.pdf");
+        std::fs::write(&outer_file, b"%PDF-1.4").expect("write outer file");
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_workspace_dir(ws.path().to_path_buf());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: outer_file.to_string_lossy().to_string(),
+        };
+        let err = ch
+            .send_attachment("123456", None, &attachment)
+            .await
+            .expect_err("an absolute target outside workspace must be refused");
+        assert!(
+            err.to_string().contains("outside workspace")
+                || err.to_string().contains("resolves outside")
+                || err.to_string().contains("path not found"),
+            "unexpected refusal error: {}",
+            err
+        );
     }
 
     // ── Message ID edge cases ─────────────────────────────────────
