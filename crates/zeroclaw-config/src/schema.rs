@@ -4523,6 +4523,31 @@ impl Config {
             })
     }
 
+    /// Resolve the effective memory backend name for `agent_alias`,
+    /// matching what the runtime actually constructs.
+    ///
+    /// The per-agent `[agents.<alias>.memory] backend` is the source of truth
+    /// for which backend the agent loop builds (see `create_memory_for_agent`
+    /// in `zeroclaw-memory`). The install-wide `[memory] backend` →
+    /// `[storage]` resolution only sees explicitly-configured storage entries
+    /// and reports `"none"` for the common modern layout — one sqlite agent
+    /// with no `[storage.sqlite]` section on disk — which misleads status
+    /// surfaces. This helper reads the agent's own backend instead. Falls back
+    /// to `resolve_active_storage().kind()` when `agent_alias` isn't
+    /// configured. Mirrors the gateway's per-agent `/api/status` resolution.
+    #[must_use]
+    pub fn effective_memory_backend(&self, agent_alias: &str) -> String {
+        self.agent(agent_alias)
+            .map(|a| a.memory.backend)
+            .map(|kind| {
+                serde_json::to_value(kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+            })
+            .unwrap_or_else(|| self.resolve_active_storage().kind().to_string())
+    }
+
     /// Resolve the active storage backend for the memory subsystem.
     ///
     /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
@@ -39500,7 +39525,7 @@ allowed_users = []
     }
 
     #[test]
-    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
         let mut config = multi_agent_test_config();
         config.channels.plugin.insert(
             "operations".to_string(),
@@ -39655,6 +39680,49 @@ allowed_users = []
             error.to_string().contains("plugins.max_active_instances"),
             "{error}"
         );
+    }
+
+    #[test]
+    async fn effective_memory_backend_prefers_agent_backend_over_install_storage() {
+        // Regression: status surfaces misreported "none" when the agent
+        // pins a backend (default sqlite) with no explicit [storage] entry
+        // on disk. The per-agent kind is what the runtime constructs.
+        let mut config = Config::default();
+        let agent = AliasedAgentConfig {
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Sqlite,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("alpha".to_string(), agent);
+
+        // Install-wide memory.backend is unset / resolves to nothing.
+        config.memory.backend = "".to_string();
+
+        assert_eq!(config.effective_memory_backend("alpha"), "sqlite");
+    }
+
+    #[test]
+    async fn effective_memory_backend_reports_agent_none() {
+        let mut config = Config::default();
+        let agent = AliasedAgentConfig {
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::None,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("alpha".to_string(), agent);
+        config.memory.backend = "sqlite".to_string();
+
+        assert_eq!(config.effective_memory_backend("alpha"), "none");
+    }
+
+    #[test]
+    async fn effective_memory_backend_falls_back_to_install_storage_for_unknown_agent() {
+        let mut config = Config::default();
+        config.memory.backend = "sqlite".to_string();
+        // No storage entry either — resolve_active_storage yields nothing.
+        assert_eq!(config.effective_memory_backend("missing"), "none");
     }
 
     #[test]

@@ -6208,10 +6208,7 @@ async fn process_channel_message_body(
                 let doc_path = docs_dir.join(&safe_name);
                 match std::fs::write(&doc_path, &attachment.data) {
                     Ok(_) => {
-                        doc_markers.push(format!(
-                            "[Document: {}]",
-                            doc_path.display()
-                        ));
+                        doc_markers.push(format!("[Document: {}]", doc_path.display()));
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12555,7 +12552,7 @@ pub async fn start_channels(
 
             println!("🦀 ZeroClaw Channel Server");
             println!("  🤖 Model:    {model} (agent: {agent_alias})");
-            let effective_backend = config.resolve_active_storage().kind();
+            let effective_backend = config.effective_memory_backend(agent_alias.as_str());
             println!(
                 "  🧠 Memory:   {} (auto-save: {})",
                 effective_backend,
