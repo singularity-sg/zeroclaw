@@ -477,9 +477,72 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     })
 }
 
+/// Resolve an outgoing local attachment target to an absolute on-disk path,
+/// bounded to `workspace_dir`.
+///
+/// Parity with the WhatsApp, Matrix, Lark and Slack channels: absolute targets
+/// are used verbatim, `/workspace/...` container paths and workspace-relative
+/// targets (the common form the agent emits, relative to its shell CWD) join
+/// `workspace_dir`, and the resolved path must canonicalize inside
+/// `workspace_dir` (the trust boundary). With no `workspace_dir` configured the
+/// target is used verbatim (legacy daemon-CWD-relative behavior).
+///
+/// This is what the channel was missing: it only recognized HTTP URLs and
+/// absolute (or `/workspace/...`) paths, so a relative marker like
+/// `[DOCUMENT:workspace/report.pdf]` was checked against the daemon process CWD
+/// and always failed with "path not found".
+fn resolve_outgoing_local_target(
+    target: &str,
+    workspace_dir: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    let Some(ws) = workspace_dir else {
+        return Ok(target.to_string());
+    };
+
+    let workspace_canon = std::fs::canonicalize(ws).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "canonicalize Telegram workspace {} failed: {err}",
+            ws.display()
+        ))
+    })?;
+
+    let raw = std::path::Path::new(target);
+    let candidate = if let Some(rel) = target.strip_prefix("/workspace/") {
+        workspace_canon.join(rel)
+    } else if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_canon.join(raw)
+    };
+
+    let candidate_canon = match std::fs::canonicalize(&candidate) {
+        Ok(p) => p,
+        Err(_) => anyhow::bail!("Telegram attachment path not found: {target}"),
+    };
+
+    if !candidate_canon.starts_with(&workspace_canon) {
+        anyhow::bail!("Telegram attachment path escapes workspace_dir: {target}");
+    }
+
+    Ok(candidate_canon.to_string_lossy().to_string())
+}
+
 /// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
     crate::orchestrator::strip_tool_call_tags(message)
+}
+
+/// True when a reply is substantive natural language worth voicing —
+/// not a URL, JSON, code block, error, or short status line.
+fn is_substantive_voice_reply(content: &str) -> bool {
+    content.len() > 40
+        && !content.starts_with("http")
+        && !content.starts_with('{')
+        && !content.starts_with('[')
+        && !content.starts_with("Error")
+        && !content.contains("```")
+        && !content.contains("tool_call")
+        && !content.contains("wttr.in")
 }
 
 fn find_matching_close(s: &str) -> Option<usize> {
@@ -1334,16 +1397,7 @@ impl TelegramChannel {
 
         // Only queue substantive natural-language replies for voice.
         // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-        let is_substantive = content.len() > 40
-            && !content.starts_with("http")
-            && !content.starts_with('{')
-            && !content.starts_with('[')
-            && !content.starts_with("Error")
-            && !content.contains("```")
-            && !content.contains("tool_call")
-            && !content.contains("wttr.in");
-
-        if !is_substantive {
+        if !is_substantive_voice_reply(content) {
             return;
         }
 
@@ -3187,22 +3241,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return Ok(());
         }
 
-        // Remap Docker container workspace path (/workspace/...) to the host
-        // workspace directory so files written by the containerised runtime
-        // can be found and sent by the host-side Telegram sender.
-        let remapped;
-        let target = if let Some(rel) = target.strip_prefix("/workspace/") {
-            if let Some(ws) = &self.workspace_dir {
-                remapped = ws.join(rel);
-                remapped.to_str().unwrap_or(target)
-            } else {
-                target
+        // Resolve the target against the channel's workspace (the bound
+        // agent's workspace dir). Absolute targets are used verbatim,
+        // `/workspace/...` container and workspace-relative targets join the
+        // workspace, all under an escape guard — so a marker like
+        // `[DOCUMENT:workspace/report.pdf]` (relative to the agent shell CWD)
+        // resolves instead of failing against the daemon's CWD.
+        let resolved = resolve_outgoing_local_target(target, self.workspace_dir.as_deref());
+        let resolved = match resolved {
+            Ok(p) => p,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"target": target, "error": format!("{}", e)})
+                        ),
+                    "Telegram attachment path resolution failed"
+                );
+                anyhow::bail!("Telegram attachment path not found: {target}");
             }
-        } else {
-            target
         };
 
-        let path = Path::new(target);
+        let path = Path::new(&resolved);
         if !path.exists() {
             anyhow::bail!("Telegram attachment path not found: {target}");
         }
@@ -4065,9 +4127,15 @@ impl Channel for TelegramChannel {
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
-        // Voice-only peers: delete the draft placeholder and let the voice
-        // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.is_voice_peer(recipient) {
+        // Voice-only peers and voice-note senders (mirror): delete the draft
+        // placeholder and let the voice bubble be the sole reply. Only when TTS
+        // is available and the reply is substantive; otherwise the text is sent.
+        // Bypassed when suppress_voice forces text.
+        if !suppress_voice
+            && self.tts_manager.is_some()
+            && is_substantive_voice_reply(text)
+            && self.is_voice_chat(recipient)
+        {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
                     .client
@@ -4310,9 +4378,13 @@ impl Channel for TelegramChannel {
             self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
         }
 
-        // Voice-only peers (or explicit force_voice): the voice note is the sole reply — skip text.
+        // Voice-only peers, voice-note senders (mirror), or explicit force_voice:
+        // the voice note is the sole reply — skip text. Only when TTS is
+        // available and the reply is substantive; otherwise fall back to text.
         if !message.suppress_voice
-            && (self.is_voice_peer(&message.recipient) || message.force_voice)
+            && self.tts_manager.is_some()
+            && is_substantive_voice_reply(&content)
+            && (self.is_voice_chat(&message.recipient) || message.force_voice)
         {
             return Ok(());
         }
@@ -4935,6 +5007,126 @@ mod tests {
         assert!(
             ch.is_voice_chat("@alice"),
             "live-resolved voice peer must remain active after voice_chats removal"
+        );
+    }
+
+    #[test]
+    fn is_substantive_voice_reply_classifies_natural_language() {
+        assert!(is_substantive_voice_reply(
+            "Here is a detailed summary of the market today across the main sectors."
+        ));
+        for non_voice in [
+            "ok",
+            "http://example.com/a/url/long/enough/to/exceed/forty/characters",
+            "{\"json\": \"body\"}",
+            "[1, 2, 3]",
+            "Error: something went wrong and this message is long enough",
+            "```\ncode block\n```",
+        ] {
+            assert!(
+                !is_substantive_voice_reply(non_voice),
+                "expected non-voice: {non_voice}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_falls_back_to_text_for_voice_note_sender_without_tts() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        // Recipient's last message was a voice note, but no TTS manager is set:
+        // the reply must fall back to text rather than being dropped.
+        ch.voice_chats.lock().unwrap().insert("123".to_string());
+
+        ch.send(&SendMessage::new(
+            "This is a substantive natural-language reply long enough to be voiced.",
+            "123",
+        ))
+        .await
+        .unwrap();
+
+        // `.expect(1)` on the mock asserts exactly one sendMessage was delivered.
+    }
+
+    #[tokio::test]
+    async fn send_skips_text_for_voice_note_sender_with_tts() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, EdgeTtsProviderConfig};
+
+        // Minimal edge-TTS config (no API key) so `with_tts` builds a manager.
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config
+            .providers
+            .tts
+            .edge
+            .insert("default".to_string(), EdgeTtsProviderConfig::default());
+        config.agents.insert(
+            "main".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.default".into()],
+                tts_provider: "edge.default".into(),
+                ..Default::default()
+            },
+        );
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_tts(&config)
+        .with_api_base(mock_server.uri());
+
+        // Recipient's last message was a voice note and TTS is available:
+        // delivery must be voice-only (no sendMessage text).
+        ch.voice_chats.lock().unwrap().insert("123".to_string());
+
+        ch.send(&SendMessage::new(
+            "This is a substantive natural-language reply long enough to be voiced.",
+            "123",
+        ))
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "voice-note sender must get voice-only delivery; got {} sendMessage requests",
+            requests.len()
         );
     }
 
@@ -6308,6 +6500,83 @@ mod tests {
 
         // Should not panic
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn telegram_send_attachment_resolves_workspace_relative_document() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ws = tempfile::tempdir().expect("tempdir");
+        let reports = ws.path().join("reports");
+        std::fs::create_dir_all(&reports).expect("make reports dir");
+        let file = reports.join("itinerary.pdf");
+        std::fs::write(&file, b"%PDF-1.4 test").expect("write fixture pe");
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(ws.path().to_path_buf());
+
+        // A workspace-relative marker target (`[DOCUMENT:reports/itinerary.pdf]`)
+        // must resolve against the channel workspace rather than the daemon CWD.
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: "reports/itinerary.pdf".to_string(),
+        };
+        let result = ch.send_attachment("123456", None, &attachment).await;
+        assert!(
+            result.is_ok(),
+            "workspace-relative document must resolve and send, got: {}",
+            result.unwrap_err()
+        );
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn telegram_send_attachment_refuses_target_escaping_workspace() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outer_file = outside.path().join("sneak.pdf");
+        std::fs::write(&outer_file, b"%PDF-1.4").expect("write outer file");
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_workspace_dir(ws.path().to_path_buf());
+
+        let attachment = TelegramAttachment {
+            kind: TelegramAttachmentKind::Document,
+            target: outer_file.to_string_lossy().to_string(),
+        };
+        let err = ch
+            .send_attachment("123456", None, &attachment)
+            .await
+            .expect_err("an absolute target outside workspace must be refused");
+        assert!(
+            err.to_string().contains("outside workspace")
+                || err.to_string().contains("resolves outside")
+                || err.to_string().contains("path not found"),
+            "unexpected refusal error: {}",
+            err
+        );
     }
 
     // ── Message ID edge cases ─────────────────────────────────────
