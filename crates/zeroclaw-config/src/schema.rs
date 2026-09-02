@@ -771,6 +771,24 @@ impl WireApi {
     }
 }
 
+/// Policy for image markers embedded in native tool-result content.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultImagePolicy {
+    /// Preserve tool-result image markers as structured `image_url` parts.
+    #[default]
+    ImageUrl,
+    /// Remove tool-result image payloads and leave a fixed notice for the model.
+    Omit,
+}
+
+fn is_default_tool_result_image_policy(value: &ToolResultImagePolicy) -> bool {
+    *value == ToolResultImagePolicy::default()
+}
+
 /// Authentication mode for model model_provider families that support more than one
 /// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
 /// single auth flow simply omit this field from their config struct.
@@ -936,6 +954,13 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// How native compatible chat-completions providers handle image markers in
+    /// role=`tool` results. `image_url` preserves structured image parts;
+    /// `omit` removes their payloads and appends a fixed notice. This does not
+    /// affect direct user image content or OpenAI Responses providers.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_default_tool_result_image_policy")]
+    pub tool_result_image_policy: ToolResultImagePolicy,
     /// Arbitrary key/value pairs forwarded verbatim as a top-level
     /// `chat_template_kwargs` object in the request body of OpenAI-compatible
     /// providers. Consumed by chat-template-aware backends such as vLLM,
@@ -15760,7 +15785,9 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
+    /// Matrix server name or homeserver URL (e.g. `"matrix.org"` or
+    /// `"https://matrix.example.org"`). Server names use standard
+    /// `/.well-known/matrix/client` discovery.
     #[tab(Connection)]
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel
@@ -27969,6 +27996,26 @@ auto_save = true
         assert!(parsed.num_ctx.is_none());
         assert!(parsed.num_predict.is_none());
         assert!(parsed.temperature_override.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn tool_result_image_policy_defaults_and_round_trips() {
+        let parsed: ModelProviderConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            parsed.tool_result_image_policy,
+            ToolResultImagePolicy::ImageUrl
+        );
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(
+            !serialized.contains("tool_result_image_policy"),
+            "the default policy should remain omitted from serialized config"
+        );
+
+        let parsed: ModelProviderConfig =
+            toml::from_str("tool_result_image_policy = \"omit\"").unwrap();
+        assert_eq!(parsed.tool_result_image_policy, ToolResultImagePolicy::Omit);
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(serialized.contains("tool_result_image_policy = \"omit\""));
     }
 
     #[::core::prelude::v1::test]
