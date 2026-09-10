@@ -1777,7 +1777,7 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref doc) = base.document_message {
+        if let Some(doc) = base.document_message.as_option() {
             let mime = doc
                 .mimetype
                 .clone()
@@ -1796,7 +1796,7 @@ impl WhatsAppWebChannel {
             };
             Self::push_downloaded_attachment(
                 client,
-                doc.as_ref() as &dyn Downloadable,
+                doc as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
