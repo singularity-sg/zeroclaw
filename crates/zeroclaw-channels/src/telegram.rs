@@ -771,7 +771,7 @@ fn format_attachment_content(
     attachment: &zeroclaw_api::media::MediaAttachment,
     local_path: &Path,
 ) -> String {
-// Videos are surfaced with an actionable `[VIDEO:path]` marker so the
+    // Videos are surfaced with an actionable `[VIDEO:path]` marker so the
     // clip path survives vision/multimodal routing and stays exempt from leak
     // detection, mirroring how `[IMAGE:path]` works for photos.
     if attachment.kind() == zeroclaw_api::media::MediaKind::Video {
@@ -914,19 +914,6 @@ fn resolve_outgoing_local_target(
 /// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
     crate::orchestrator::strip_tool_call_tags(message)
-}
-
-/// True when a reply is substantive natural language worth voicing —
-/// not a URL, JSON, code block, error, or short status line.
-fn is_substantive_voice_reply(content: &str) -> bool {
-    content.len() > 40
-        && !content.starts_with("http")
-        && !content.starts_with('{')
-        && !content.starts_with('[')
-        && !content.starts_with("Error")
-        && !content.contains("```")
-        && !content.contains("tool_call")
-        && !content.contains("wttr.in")
 }
 
 fn find_matching_close(s: &str) -> Option<usize> {
@@ -9166,7 +9153,6 @@ mod tests {
                 ..Default::default()
             },
         );
-
 
         let ch = TelegramChannel::new(
             "fake-token".into(),
