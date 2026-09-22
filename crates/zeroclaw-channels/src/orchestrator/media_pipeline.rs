@@ -769,6 +769,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: b"\x00\x00\x00 ftypmp42 video-bytes".to_vec(),
             mime_type: Some("video/mp4".to_string()),
+            marker: None,
         };
         let result = pipeline.process("look", &[video]).await;
 
@@ -793,6 +794,7 @@ mod tests {
             file_name: "big.mp4".to_string(),
             data: vec![0u8; 21 * 1024 * 1024],
             mime_type: Some("video/mp4".to_string()),
+            marker: None,
         };
         let result = pipeline.process("watch", &[video]).await;
 
@@ -815,6 +817,7 @@ mod tests {
             file_name: "note.mp4".to_string(),
             data: b"video-bytes".to_vec(),
             mime_type: None,
+            marker: None,
         };
         let result = pipeline.process("watch", &[video]).await;
         assert!(
