@@ -177,7 +177,14 @@ impl GroqProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            api_url: cfg
+                .base
+                .uri
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| {
+                    "https://api.groq.com/openai/v1/audio/transcriptions".to_string()
+                }),
             model: cfg
                 .model
                 .clone()
@@ -278,7 +285,12 @@ impl OpenAiWhisperProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+            api_url: cfg
+                .base
+                .uri
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1/audio/transcriptions".to_string()),
             api_key,
             model: cfg
                 .model
@@ -1968,6 +1980,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn groq_and_openai_typed_configs_honor_uri_override() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // No override: each family keeps its default endpoint.
+        let base = zeroclaw_config::schema::TranscriptionProviderConfig {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let groq = GroqProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: base.clone(),
+                model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            groq.api_url,
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        let openai = OpenAiWhisperProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: base.clone(),
+                model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            openai.api_url,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+
+        // `uri` override: the agent-bound dispatch must reach the custom
+        // endpoint, mirroring the `[providers.tts.*].uri` behavior.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello override",
+            })))
+            .mount(&server)
+            .await;
+        let mut typed = zeroclaw_config::providers::TranscriptionProviders::default();
+        typed.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("{}/transcribe", server.uri())),
+                    ..Default::default()
+                },
+                model: None,
+            },
+        );
+        let manager = TranscriptionManager::empty()
+            .with_typed_providers(&typed)
+            .with_agent_transcription_provider("groq.default");
+        let text = manager
+            .transcribe(b"audio-bytes", "voice.wav")
+            .await
+            .unwrap();
+        assert_eq!(text, "hello override");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/transcribe");
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(multipart.contains("whisper-large-v3-turbo"));
+    }
     #[test]
     fn google_stt_request_rejects_malformed_header_without_echoing_key() {
         let api_key = "api-key-123\r\nleaked";
@@ -2770,6 +2854,7 @@ mod tests {
                     api_key: Some("gsk_test_key".to_string()),
                     language: None,
                     initial_prompt: None,
+                    uri: None,
                 },
                 model: Some("whisper-large-v3-turbo".to_string()),
             },

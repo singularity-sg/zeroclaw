@@ -6199,6 +6199,14 @@ pub struct TranscriptionProviderConfig {
     /// silently ignored where not applicable.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Endpoint URI for HTTP-based backends. Overrides the family default
+    /// when pointing at a compatible third-party Whisper-compatible API
+    /// (OpenRouter, Azure, self-hosted proxies). Set to the **full** URL —
+    /// there is no separate path-suffix field. Honored by the Whisper-style
+    /// families (groq, openai); other families have provider-specific
+    /// request shapes and ignore it.
+    #[serde(default, alias = "api_url")]
+    pub uri: Option<String>,
 }
 
 /// Trait that every transcription endpoint enum implements. Mirrors
@@ -44625,7 +44633,7 @@ allowed_users = []
     }
 
     #[test]
-async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
         let mut config = multi_agent_test_config();
         config.channels.plugin.insert(
             "operations".to_string(),
