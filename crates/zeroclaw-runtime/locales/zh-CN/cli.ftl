@@ -880,6 +880,7 @@ turn-failed-attachment-omitted = [附件已省略：提供方在失败的回合�
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
 turn-max-iterations-reached = *轮次已停止：已达到最大工具迭代次数（{ $max_iterations }）。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+history-tool-result-evicted-stub = [earlier tool results omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 已超出历史消息数量限制
 history-trim-reason-recovery = 上下文窗口溢出恢复

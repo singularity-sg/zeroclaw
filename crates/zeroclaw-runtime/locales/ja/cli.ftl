@@ -879,6 +879,7 @@ turn-failed-attachment-omitted = [添付は省略されました: 失敗した�
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
 turn-max-iterations-reached = *ターン停止: ツールの最大反復回数 ({ $max_iterations }) に達しました。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+history-tool-result-evicted-stub = [earlier tool results omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
 history-trim-reason-recovery = コンテキストウィンドウのオーバーフロー復旧

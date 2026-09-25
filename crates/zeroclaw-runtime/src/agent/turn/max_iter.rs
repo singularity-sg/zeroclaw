@@ -154,7 +154,9 @@ pub(crate) async fn finish_after_max_iterations(
         );
         dropped_messages += trim.dropped_messages;
         if trim.outcome == super::PreDispatchOutcome::Trimmed {
-            dropped_turns += 1;
+            // Only a genuine whole-turn drop counts as a dropped turn; an
+            // intra-turn tool-result eviction keeps every message in place.
+            dropped_turns += usize::from(trim.dropped_messages > 0);
             continue;
         }
         trim.dropped_messages = dropped_messages;

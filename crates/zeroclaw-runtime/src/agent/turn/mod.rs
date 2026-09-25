@@ -433,6 +433,7 @@ fn context_window_exceeded_error(
 struct PreDispatchTrimResult {
     outcome: PreDispatchOutcome,
     dropped_messages: usize,
+    evicted_messages: usize,
     kept_turns: usize,
 }
 
@@ -495,13 +496,39 @@ fn surface_oversized_dispatch_if_needed(
 ) -> PreDispatchTrimResult {
     let outcome;
     let mut dropped_messages = 0;
+    let mut evicted_messages = 0usize;
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
         outcome = PreDispatchOutcome::Fit;
     } else {
         dropped_messages =
             crate::agent::history_trim::drop_oldest_whole_turn(history, *crumb_present);
         if dropped_messages == 0 {
-            outcome = PreDispatchOutcome::Floor;
+            // Whole-turn trimming cannot shrink the newest turn. Before
+            // declaring the unsatisfiable floor, reclaim the current turn's
+            // accumulated tool results one message at a time: a tool loop
+            // that pulled large per-iteration results can overflow the
+            // budget with every older turn already dropped. Each call evicts
+            // at most one message; callers re-measure and re-invoke until
+            // the population fits or nothing evictable remains.
+            if crate::agent::history_trim::evict_oldest_current_turn_tool_result(history) {
+                evicted_messages = 1;
+                outcome = PreDispatchOutcome::Trimmed;
+                let tokens_now = crate::agent::history::estimate_history_tokens(history);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_messages": 1,
+                            "estimated_tokens_after": tokens_now,
+                            "budget": context_token_budget,
+                        })),
+                    "Intra-turn eviction: replaced an accumulated tool result with a stub to fit the context budget",
+                );
+            } else {
+                outcome = PreDispatchOutcome::Floor;
+            }
         } else {
             *crumb_present =
                 crate::agent::history_trim::insert_breadcrumb_deduped(history, *crumb_present);
@@ -511,6 +538,7 @@ fn surface_oversized_dispatch_if_needed(
     PreDispatchTrimResult {
         outcome,
         dropped_messages,
+        evicted_messages,
         kept_turns: crate::agent::history_trim::count_turns(history)
             .saturating_sub(usize::from(*crumb_present)),
     }
@@ -1516,9 +1544,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // estimate cannot predict the contribution of an image or hook
             // suffix, so it must not choose several drops ahead of this check.
             let mut total_dropped_messages = trim_result.dropped_messages;
+            let mut total_evicted_messages = trim_result.evicted_messages;
             let mut dropped_turns = usize::from(trim_result.dropped_messages > 0);
             let mut tokens_after_dispatch = tokens_before_dispatch;
-            let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
+            // The bound must also cover intra-turn eviction rounds: each round
+            // either drops a whole turn or evicts at most one tool-result
+            // message, so turns + messages is a safe upper bound.
+            let max_iterations = crate::agent::history_trim::count_turns(turn_state.history)
+                + turn_state.history.len()
+                + 2;
             for _ in 0..max_iterations {
                 // Preserve the hook's mutations to retained messages by
                 // trimming the already-mutated post-hook snapshot directly,
@@ -1560,6 +1594,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         false,
                     );
                 }
+                // Mirror any intra-turn tool-result evictions that the
+                // durable trim performed, so the dispatched request carries
+                // the same stubs the persisted history does. Eviction is
+                // deterministic (oldest evictable first, newest round kept),
+                // so replaying the same count on the snapshot-derived prefix
+                // stubs the same messages.
+                for _ in 0..total_evicted_messages {
+                    crate::agent::history_trim::evict_oldest_current_turn_tool_result(
+                        &mut trimmed_post_hook,
+                    );
+                }
                 // Re-append the hook's transient suffix and re-apply prompt
                 // framing so the system anchor stays consistent.
                 trimmed_post_hook.extend(suffix);
@@ -1595,9 +1640,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 );
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
+                total_evicted_messages += trim_result.evicted_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
                 let dropped_more = turn_state.history.len() != before_len
-                    || turn_state.crumb_present != before_crumb;
+                    || turn_state.crumb_present != before_crumb
+                    || trim_result.evicted_messages > 0;
                 if !dropped_more {
                     break;
                 }
@@ -1609,6 +1656,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 trim_budget
             };
             trim_result.dropped_messages = total_dropped_messages;
+            trim_result.evicted_messages = total_evicted_messages;
             record_dispatch_trim(
                 (active_model_provider_name, provider_request_model),
                 &trim_result,
@@ -4621,6 +4669,94 @@ mod trim_budget_tests {
                 .iter()
                 .any(|m| m.content == crumb.content && m.role == crumb.role),
             "final history must include the model-visible breadcrumb"
+        );
+    }
+
+    #[test]
+    fn surface_evicts_current_turn_tool_results_when_no_turns_droppable() {
+        let big = "y".repeat(2000);
+        let tool_msg = |id: &str| {
+            ChatMessage::tool(
+                serde_json::json!({ "tool_call_id": id, "content": big.clone() }).to_string(),
+            )
+        };
+        let mut history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("new question"),
+            ChatMessage::assistant("working"),
+            tool_msg("t1"),
+            ChatMessage::assistant("working more"),
+            tool_msg("t2"),
+            ChatMessage::assistant("almost done"),
+            tool_msg("t3"),
+        ];
+        let mut crumb_present = false;
+        let budget = 700usize;
+
+        // First call: the older whole turn is droppable.
+        let tokens_before = crate::agent::history::estimate_history_tokens(&history) as u64;
+        let first = surface_oversized_dispatch_if_needed(
+            &mut history,
+            &mut crumb_present,
+            tokens_before,
+            budget,
+        );
+        assert_eq!(first.outcome, PreDispatchOutcome::Trimmed);
+        assert_eq!(first.dropped_messages, 2);
+        assert_eq!(first.evicted_messages, 0);
+
+        // Now no older whole turn remains: eviction must reclaim the current
+        // turn's accumulated tool results instead of declaring the floor.
+        let mut evicted_total = 0;
+        for _ in 0..20 {
+            let tokens = crate::agent::history::estimate_history_tokens(&history) as u64;
+            if tokens <= budget as u64 {
+                break;
+            }
+            let round = surface_oversized_dispatch_if_needed(
+                &mut history,
+                &mut crumb_present,
+                tokens,
+                budget,
+            );
+            assert_eq!(
+                round.outcome,
+                PreDispatchOutcome::Trimmed,
+                "eviction must reclaim weight before the floor is declared"
+            );
+            assert_eq!(round.dropped_messages, 0);
+            evicted_total += round.evicted_messages;
+        }
+        assert!(
+            evicted_total >= 1,
+            "at least one tool result must be evicted"
+        );
+        assert!(
+            crate::agent::history::estimate_history_tokens(&history) <= budget,
+            "eviction must bring the population under the budget"
+        );
+        assert!(crumb_present, "the first drop must leave a breadcrumb");
+
+        // The oldest evicted result keeps its tool_call_id and becomes a stub.
+        let t1 = history
+            .iter()
+            .find(|m| m.role == "tool" && m.content.contains("t1"))
+            .expect("evicted message must remain in place");
+        let value: serde_json::Value =
+            serde_json::from_str(&t1.content).expect("stub must stay a JSON envelope");
+        assert_eq!(value["tool_call_id"], "t1");
+        assert!(
+            value["content"].as_str().unwrap().contains("omitted"),
+            "stub text must mark the eviction"
+        );
+        // The newest tool result survives whole.
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains(&big)),
+            "the newest tool result must survive eviction"
         );
     }
 }

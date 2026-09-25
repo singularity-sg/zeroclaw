@@ -997,6 +997,9 @@ turn-context-window-exceeded-error = This request exceeds the selected model's c
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+# Stub replacing an evicted tool result within the current turn when the
+# context budget is exceeded mid-turn (intra-turn tool-result eviction).
+history-tool-result-evicted-stub = [earlier tool results omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = history message limit exceeded

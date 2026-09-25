@@ -881,6 +881,7 @@ turn-failed-attachment-omitted = [adjunto omitido: el proveedor lo rechazó en e
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) no estaba disponible; esta respuesta fue generada por { $actual_model } ({ $actual_provider }).
 turn-max-iterations-reached = *Turno detenido: se alcanzó el máximo de iteraciones de herramientas ({ $max_iterations }).*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+history-tool-result-evicted-stub = [earlier tool results omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = límite de mensajes del historial superado
 history-trim-reason-recovery = recuperación tras desbordamiento de la ventana de contexto
