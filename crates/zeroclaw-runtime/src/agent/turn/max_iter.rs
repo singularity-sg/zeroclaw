@@ -263,7 +263,9 @@ pub(crate) async fn finish_after_max_iterations(
                             "turn-context-hook-mutation-unsafe-error",
                         ));
                     }
-                    dropped_turns += 1;
+                    // Only a genuine whole-turn drop counts as a dropped turn; an
+                    // intra-turn tool-result eviction keeps every message in place.
+                    dropped_turns += usize::from(trim.dropped_messages > 0);
                     messages = super::vision_route::prepare_messages_for_iteration(
                         history,
                         multimodal_config,
