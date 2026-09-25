@@ -373,6 +373,104 @@ pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>, crumb_prese
     dropped
 }
 
+/// Replace the oldest evictable tool-result message inside the most recent
+/// whole turn with a short stub. This is the intra-turn counterpart of
+/// `drop_oldest_whole_turn`: whole-turn trimming can never shrink the newest
+/// turn, so a tool loop that accumulates large per-iteration results (web
+/// research, big file reads) can overflow the context budget with every
+/// older turn already dropped. Eviction reclaims that weight one message at
+/// a time while keeping provider contracts intact:
+///
+/// - native `role=tool` messages keep their JSON envelope and original
+///   `tool_call_id` (adapters parse the id out of the content string);
+/// - prompt-mode `[Tool results]` user carriers keep their prefix, so
+///   turn-boundary accounting (`is_turn_boundary`) is unchanged;
+/// - tool results after the newest assistant message — the round the model
+///   is about to act on — are never evicted;
+/// - system, user-prompt, and assistant messages are never touched;
+/// - already-evicted stubs are never evicted again, so repeated calls always
+///   make progress and callers terminate.
+///
+/// Returns true when a message was evicted; false means nothing evictable
+/// remains and the caller may treat the population as an unsatisfiable floor.
+pub(crate) fn evict_oldest_current_turn_tool_result(history: &mut [ChatMessage]) -> bool {
+    let stub_text = crate::i18n::get_required_cli_string("history-tool-result-evicted-stub");
+    // The current turn starts after the last turn boundary. System messages
+    // cannot be boundaries and sit at the front, so scanning the whole slice
+    // for the last boundary is safe: a history with no boundary at all has no
+    // user prompt and nothing addressable to evict.
+    let current_turn_start = history
+        .iter()
+        .rposition(is_turn_boundary)
+        .map_or(history.len(), |idx| idx + 1);
+    if current_turn_start >= history.len() {
+        return false;
+    }
+    // Evictable tool results are the ones the model has already consumed:
+    // everything before the newest assistant message of the current turn.
+    // The trailing results after that assistant message belong to the round
+    // the model is about to act on and must stay.
+    let last_assistant = history[current_turn_start..]
+        .iter()
+        .rposition(|m| m.role == "assistant")
+        .map_or(0, |offset| current_turn_start + offset);
+    let evictable = (current_turn_start..last_assistant).find(|&idx| {
+        let msg = &history[idx];
+        if msg.role == "tool" {
+            return is_evictable_tool_envelope(&msg.content, &stub_text);
+        }
+        msg.role == "user"
+            && msg.content.starts_with(TOOL_RESULTS_PREFIX)
+            && msg.content != tool_results_stub(&stub_text)
+    });
+    let Some(idx) = evictable else {
+        return false;
+    };
+    let msg = &mut history[idx];
+    if msg.role == "tool" {
+        msg.content = stubbed_tool_envelope(&msg.content, &stub_text);
+    } else {
+        msg.content = tool_results_stub(&stub_text);
+    }
+    true
+}
+
+/// The stub content for a prompt-mode `[Tool results]` carrier. The prefix is
+/// load-bearing: `is_turn_boundary` treats prefixed carriers as part of the
+/// current turn, so a stub without it would split the turn accounting.
+fn tool_results_stub(stub_text: &str) -> String {
+    format!("{TOOL_RESULTS_PREFIX}\n{stub_text}")
+}
+
+/// A `role=tool` message is evictable only when its content parses as a JSON
+/// object whose `content` field is not already the eviction stub. The
+/// original object is preserved so the adapter keeps resolving the same
+/// `tool_call_id` (and any auxiliary fields) after the swap.
+fn is_evictable_tool_envelope(content: &str, stub_text: &str) -> bool {
+    parse_tool_envelope(content)
+        .is_some_and(|envelope| envelope.get("content").and_then(|c| c.as_str()) != Some(stub_text))
+}
+
+/// Rewrite a `role=tool` envelope's `content` field to the stub, preserving
+/// every other field (`tool_call_id`, optional `name`, ...). Returns None
+/// when the content is not a JSON object; callers must treat None as
+/// not-evictable rather than fabricating an envelope.
+fn parse_tool_envelope(content: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+}
+
+fn stubbed_tool_envelope(content: &str, stub_text: &str) -> String {
+    let mut envelope =
+        parse_tool_envelope(content).expect("caller checked the envelope parses as a JSON object");
+    envelope.insert(
+        "content".to_string(),
+        serde_json::Value::String(stub_text.to_string()),
+    );
+    serde_json::Value::Object(envelope).to_string()
+}
+
 /// Front breadcrumb injected after the system messages so the model SEES that
 /// earlier turns were cut and cannot confabulate dropped work as present.
 pub fn breadcrumb() -> ChatMessage {
@@ -1688,5 +1786,162 @@ mod tests {
             with_marker.get(2),
             Some(m) if m.role == "user" && m.content == "newest request"
         ));
+    }
+
+    fn native_tool_result(id: &str, body: impl Into<String>) -> ChatMessage {
+        ChatMessage::tool(
+            serde_json::json!({ "tool_call_id": id, "content": body.into() }).to_string(),
+        )
+    }
+
+    fn current_turn_tool_history() -> Vec<ChatMessage> {
+        // A realistic mid-turn population: the tool loop is between rounds,
+        // so the history ends with the newest round's tool results (no
+        // assistant reply after them yet). Plain user messages would start a
+        // new turn, so the current turn holds only the prompt, assistant
+        // narration, and tool results.
+        vec![
+            sys("system prompt"),
+            user("big research question"),
+            asst("thinking"),
+            native_tool_result("t1", "x".repeat(4000)),
+            asst("thinking more"),
+            native_tool_result("t2", "y".repeat(4000)),
+        ]
+    }
+
+    #[test]
+    fn eviction_stubs_oldest_native_tool_result_and_preserves_id() {
+        let mut history = current_turn_tool_history();
+        assert!(
+            evict_oldest_current_turn_tool_result(&mut history),
+            "the oldest tool result should be evictable"
+        );
+        let evicted = history
+            .iter()
+            .find(|m| m.role == "tool" && m.content.contains("omitted"))
+            .expect("evicted message must remain as a stub");
+        let value: serde_json::Value =
+            serde_json::from_str(&evicted.content).expect("stub must stay a JSON envelope");
+        assert_eq!(value["tool_call_id"], "t1", "tool_call_id must survive");
+        assert!(
+            value["content"].as_str().unwrap().contains("omitted"),
+            "stub text must mark the eviction"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("y".repeat(1000).as_str())),
+            "the newer tool result must be untouched"
+        );
+    }
+
+    #[test]
+    fn eviction_never_touches_newest_round_or_prompts() {
+        let mut history = current_turn_tool_history();
+        // t2 sits after the last assistant message: it is the newest round
+        // the model is about to act on, so only t1 is evictable.
+        assert!(evict_oldest_current_turn_tool_result(&mut history));
+        assert!(
+            !evict_oldest_current_turn_tool_result(&mut history),
+            "the newest round must never be evicted"
+        );
+        assert_eq!(history[0].content, "system prompt");
+        assert_eq!(history[1].content, "big research question");
+        assert_eq!(history[2].content, "thinking");
+        assert_eq!(history[4].content, "thinking more");
+        assert!(
+            history[5].content.contains("y".repeat(1000).as_str()),
+            "the newest round's result body must survive whole"
+        );
+    }
+
+    #[test]
+    fn eviction_skips_non_json_tool_messages() {
+        let mut history = vec![
+            sys("system prompt"),
+            user("prompt"),
+            asst("working"),
+            tool("plain text result, not json"),
+            native_tool_result("t2", "json result"),
+            asst("wrapping up"),
+        ];
+        // The non-JSON tool message is skipped; the JSON one is evicted.
+        assert!(evict_oldest_current_turn_tool_result(&mut history));
+        assert_eq!(history[3].content, "plain text result, not json");
+        let value: serde_json::Value =
+            serde_json::from_str(&history[4].content).expect("stub stays JSON");
+        assert_eq!(value["tool_call_id"], "t2");
+        assert!(value["content"].as_str().unwrap().contains("omitted"));
+    }
+
+    #[test]
+    fn eviction_of_prompt_mode_carrier_keeps_prefix() {
+        let mut history = vec![
+            sys("system prompt"),
+            user("question"),
+            asst("working"),
+            ChatMessage::user(format!("[Tool results]\n{}", "z".repeat(4000))),
+            asst("working more"),
+            ChatMessage::user(format!("[Tool results]\n{}", "w".repeat(4000))),
+        ];
+        assert!(evict_oldest_current_turn_tool_result(&mut history));
+        let stubbed = &history[3];
+        assert!(
+            stubbed.content.starts_with(TOOL_RESULTS_PREFIX),
+            "stubbed carrier must keep the [Tool results] prefix"
+        );
+        assert!(stubbed.content.contains("omitted"));
+        assert!(
+            history[5].content.contains("wwww"),
+            "newest carrier must be untouched"
+        );
+        // Only the carrier before the last assistant message is evictable.
+        assert!(!evict_oldest_current_turn_tool_result(&mut history));
+    }
+
+    #[test]
+    fn eviction_repeated_until_nothing_evictable() {
+        let mut history = vec![
+            sys("system prompt"),
+            user("question"),
+            asst("round one"),
+            native_tool_result("t1", "a".repeat(2000)),
+            asst("round two"),
+            native_tool_result("t2", "b".repeat(2000)),
+            asst("round three"),
+            native_tool_result("t3", "c".repeat(2000)),
+            asst("still going"),
+            native_tool_result("t4", "d".repeat(2000)),
+        ];
+        // t1, t2, t3 are evictable (before the last assistant "still
+        // going"); the newest round t4 must never be evicted.
+        let mut evictions = 0;
+        while evict_oldest_current_turn_tool_result(&mut history) {
+            evictions += 1;
+        }
+        assert_eq!(evictions, 3, "exactly the three older results evict");
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("d".repeat(1000).as_str())),
+            "the newest round's body must survive"
+        );
+        assert!(
+            history
+                .iter()
+                .filter(|m| m.role == "tool")
+                .all(|m| m.content.contains("omitted")
+                    || m.content.contains("d".repeat(1000).as_str())),
+            "every tool message is either stubbed or the newest round"
+        );
+    }
+
+    #[test]
+    fn eviction_returns_false_without_current_turn_tool_results() {
+        let mut history = vec![sys("system prompt"), user("hello"), asst("hi")];
+        assert!(!evict_oldest_current_turn_tool_result(&mut history));
+        let mut empty: Vec<ChatMessage> = Vec::new();
+        assert!(!evict_oldest_current_turn_tool_result(&mut empty));
     }
 }

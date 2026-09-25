@@ -30,6 +30,32 @@ messages or breaking a tool exchange.
 Leading system messages are retained. When no trim is needed, message order and
 shape are left unchanged.
 
+## Intra-turn tool-result eviction
+
+Whole-turn trimming can never shrink the newest turn, so a tool loop that
+accumulates large per-iteration results (for example web research that pulls
+big pages every iteration) can push the next dispatch over the token budget
+with every older turn already dropped. When the per-iteration pre-dispatch
+budget gate reaches that floor, it first evicts the current turn's
+already-consumed tool results before failing the turn:
+`history_trim::evict_oldest_current_turn_tool_result` replaces the oldest
+evictable tool-result message with a short localized stub, one message per
+gate round, until the measured population fits.
+
+Eviction preserves provider contracts: native `role=tool` messages keep their
+JSON envelope and original `tool_call_id`, prompt-mode `[Tool results]`
+carriers keep their prefix (so turn-boundary accounting is unchanged), and the
+trailing tool results after the newest assistant message — the round the model
+is about to act on — are never evicted. System messages, the user prompt, and
+assistant narration are never touched.
+
+Eviction targets the dispatch trim budget, which also keeps the population
+under the model's context window. Exceeding the trim budget with nothing left
+to drop or evict is not itself fatal: the request is still dispatched as long
+as it fits the model context window (the trim target is advisory). The turn
+fails only when the retained population exceeds the model context window, so
+eviction is what keeps a ballooning tool loop from ever reaching that failure.
+
 ## Token budget
 
 The token budget comes from `ResolvedRuntime::effective_context_budget()`:
