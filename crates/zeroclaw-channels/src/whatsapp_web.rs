@@ -3607,15 +3607,21 @@ impl Channel for WhatsAppWebChannel {
             .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
             .collect::<Vec<_>>();
 
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Only substantive messages (not tool outputs) are queued.
+        // Voice chat mode: a substantive natural-language reply is queued as a
+        // voice note and the text send is skipped (strict mirror — voice in,
+        // voice out). Only substantive messages (not tool outputs) are queued.
         // A debounce task waits 10s after the last substantive message, then
-        // sends ONE voice note. Text in → text out. Voice in → text + voice out.
+        // sends ONE voice note. Text in → text out. Voice in → voice note only.
         let is_voice_chat = self
             .voice_chats
             .lock()
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
+
+        // Strict-mirror flag: when the last incoming message was a voice note and
+        // TTS is available, the substantive answer is delivered as a voice note
+        // only. Non-substantive output (tool progress, errors) still goes as text.
+        let mut voice_only_delivery = false;
 
         if is_voice_chat && let Some(tts_manager) = self.tts_manager.clone() {
             let content = &text_content;
@@ -3639,6 +3645,8 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if skip_reason.is_none() {
+                // The voice note is the sole reply — skip the text send below.
+                voice_only_delivery = true;
                 let pending = self.pending_voice.clone();
                 let voice_chats = self.voice_chats.clone();
                 let client_clone = client.clone();
@@ -3697,7 +3705,8 @@ impl Channel for WhatsAppWebChannel {
                     }
                 });
             }
-            // Fall through to send text normally (voice chat gets BOTH)
+            // Non-substantive output (tool progress, errors) falls through to
+            // text; substantive answers skip it via voice_only_delivery.
         }
 
         let mut delivered_markers = 0usize;
@@ -3792,6 +3801,13 @@ impl Channel for WhatsAppWebChannel {
         }
 
         if !markers.is_empty() && text_content.is_empty() && delivered_markers > 0 {
+            return Ok(());
+        }
+
+        // Voice-only delivery (strict mirror): the substantive answer was queued
+        // as a voice note by the debounce task, so skip the text send — the voice
+        // note is the sole reply. Attachments/markers were already delivered.
+        if voice_only_delivery {
             return Ok(());
         }
 
