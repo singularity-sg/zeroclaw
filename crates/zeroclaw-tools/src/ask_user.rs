@@ -55,7 +55,13 @@ impl Tool for AskUserTool {
     fn description(&self) -> &str {
         "Ask the user a question and wait for their response. \
          Sends the question to a messaging channel and blocks until the user replies \
-         or the timeout expires. Optionally provide choices for structured responses."
+         or the timeout expires. Optionally provide choices for structured responses.\n\
+         \n\
+         With `recipient` (explicit, or auto-filled from the current conversation on \
+         channel turns) the question is delivered to that chat and the tool returns \
+         immediately — do not wait for the answer; it arrives as the next inbound \
+         message in that conversation. Without a recipient (CLI/ACP back-channel \
+         turns) the tool blocks until the user replies or the timeout expires."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,6 +84,14 @@ impl Tool for AskUserTool {
                 "channel": {
                     "type": "string",
                     "description": "Target channel name. Defaults to the first available channel if omitted."
+                },
+                "recipient": {
+                    "type": "string",
+                    "description": "Chat address to deliver the question to (e.g. a WhatsApp chat JID \
+                                    or phone number, a Telegram chat id). Defaults to the current \
+                                    conversation's chat on channel turns. With a recipient the tool \
+                                    delivers the question and returns immediately — the reply arrives \
+                                    as the next inbound message, it does not block."
                 }
             },
             "required": ["question"]
@@ -134,6 +148,16 @@ impl Tool for AskUserTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string());
 
+        // Explicit chat address. The turn engine also injects one from the
+        // originating conversation (see `delivery_defaults`), so on channel
+        // turns this is normally always present.
+        let recipient: Option<String> = args
+            .get("recipient")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
         // Resolve channel from handle — block-scoped to drop the RwLock guard
         // before any `.await` (parking_lot guards are !Send).
         let (channel_name, channel): (String, Arc<dyn Channel>) = {
@@ -177,6 +201,58 @@ impl Tool for AskUserTool {
                 (name.clone(), ch.clone())
             }
         };
+
+        // Deliver-and-return: when the question targets a specific chat, its
+        // reply arrives through the channel's normal inbound pipeline as a new
+        // message. Spawning a second `listen` here would race the channel's
+        // own listener — persistent-connection channels (whatsapp-web, telegram
+        // getUpdates) have exactly one inbound pump, and a second one steals
+        // updates or replaces the dispatch target — so the tool returns
+        // immediately instead of blocking on `listen`.
+        if let Some(recipient) = recipient.as_deref() {
+            let text = format_question(&question, choices.as_deref());
+            let msg = SendMessage::new(&text, recipient);
+            if let Err(e) = channel.send(&msg).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": &channel_name,
+                            "recipient": recipient,
+                            "error": format!("{}", e),
+                        })),
+                    "ask_user: delivering question to recipient failed"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Failed to send question to channel '{channel_name}' for recipient \
+                         '{recipient}': {e}"
+                    )),
+                });
+            }
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "channel": &channel_name,
+                        "recipient": recipient,
+                    })),
+                "ask_user: question delivered to recipient"
+            );
+            return Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Question delivered to '{recipient}' on channel '{channel_name}'. The reply \
+                     will arrive as the next inbound message in that conversation — do not wait \
+                     for it here; end your turn or continue with other work."
+                )
+                .into(),
+                error: None,
+            });
+        }
 
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
@@ -716,6 +792,192 @@ mod tests {
         assert!(
             !*ch.listen_called.lock(),
             "must not fall through to listen on a structured-only channel"
+        );
+    }
+
+    /// Records every send as (recipient, content) and marks any `listen`
+    /// call. Persistent-connection channels (whatsapp-web, telegram) have a
+    /// single inbound pump: a second `listen` would steal updates or replace
+    /// the dispatch target, so a recipient-targeted ask must never listen.
+    struct RecordingChannel {
+        channel_name: String,
+        sent: Arc<RwLock<Vec<(String, String)>>>,
+        listen_called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Shared handles a test reads back after `execute` returns.
+    struct RecordingHandles {
+        sent: Arc<RwLock<Vec<(String, String)>>>,
+        listen_called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RecordingChannel {
+        fn new(name: &str) -> (Self, RecordingHandles) {
+            let sent = Arc::new(RwLock::new(Vec::new()));
+            let listen_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    channel_name: name.to_string(),
+                    sent: Arc::clone(&sent),
+                    listen_called: Arc::clone(&listen_called),
+                },
+                RecordingHandles {
+                    sent,
+                    listen_called,
+                },
+            )
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent
+                .write()
+                .push((message.recipient.clone(), message.content.clone()));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.listen_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_recipient_delivers_without_listen() {
+        let (ch, handles) = RecordingChannel::new("whatsapp");
+        let tool = make_tool_with_channels(vec![("whatsapp", Arc::new(ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({
+                "question": "Are you skipping dinner tonight?",
+                "recipient": "+6593826756@s.whatsapp.net",
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let sent = handles.sent.read();
+        assert_eq!(sent.len(), 1, "exactly one send");
+        assert_eq!(sent[0].0, "+6593826756@s.whatsapp.net");
+        assert!(sent[0].1.contains("Are you skipping dinner tonight?"));
+        assert!(
+            !handles
+                .listen_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a recipient-targeted ask must not spawn a second listen"
+        );
+        let output = result.output.to_string();
+        assert!(
+            output.contains("delivered") && output.contains("+6593826756@s.whatsapp.net"),
+            "output must tell the model the question landed; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_recipient_with_choices_skips_native_choice_flow() {
+        // With choices, the pre-recipient path called request_choice (native
+        // UI for the CURRENT session) — wrong when the question targets a
+        // specific chat. The recipient path must send the numbered list as
+        // text and return.
+        let (ch, handles) = RecordingChannel::new("whatsapp");
+        let tool = make_tool_with_channels(vec![("whatsapp", Arc::new(ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({
+                "question": "Dinner at home or out?",
+                "choices": ["Home", "Out"],
+                "recipient": "+6593826756@s.whatsapp.net"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let sent = handles.sent.read();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].1.contains("1. Home"),
+            "choices rendered: {}",
+            sent[0].1
+        );
+        assert!(sent[0].1.contains("Reply with a number"));
+        assert!(
+            !handles
+                .listen_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn recipient_send_failure_reports_error() {
+        struct FailingSendChannel {
+            channel_name: String,
+        }
+        impl ::zeroclaw_api::attribution::Attributable for FailingSendChannel {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait]
+        impl Channel for FailingSendChannel {
+            fn name(&self) -> &str {
+                &self.channel_name
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                anyhow::bail!("delivery refused")
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("listen must not be called")
+            }
+        }
+
+        let tool = make_tool_with_channels(vec![(
+            "whatsapp",
+            Arc::new(FailingSendChannel {
+                channel_name: "whatsapp".to_string(),
+            }) as Arc<dyn Channel>,
+        )]);
+        let result = tool
+            .execute(json!({
+                "question": "Hello?",
+                "recipient": "+6593826756@s.whatsapp.net"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("whatsapp") && err.contains("delivery refused"),
+            "error should name channel and cause; got: {err}"
         );
     }
 }
