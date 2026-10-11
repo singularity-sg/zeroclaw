@@ -50,6 +50,42 @@ pub(crate) fn maybe_inject_originating_channel(
     }
 }
 
+/// ask_user sends its question with an empty recipient unless one is given,
+/// and on persistent-connection channels an empty recipient delivers nowhere
+/// (their `send` is a real chat delivery, not a CLI/ACP back-channel write).
+/// When the turn carries a reply target — the agent is mid-conversation with
+/// a real chat — default the question to that chat. An explicit `recipient`
+/// in the call wins; turns without a reply target (CLI, ACP, RPC) keep the
+/// blocking back-channel behavior.
+fn maybe_inject_ask_user_recipient(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_reply_target: Option<&str>,
+) {
+    if tool_name != "ask_user" {
+        return;
+    }
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+    let needs_recipient = args
+        .get("recipient")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if needs_recipient {
+        args.insert(
+            "recipient".to_string(),
+            serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+}
+
 pub(crate) fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
@@ -59,6 +95,7 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
 ) {
     // Interactive tools first — independent of cron delivery defaults.
     maybe_inject_originating_channel(tool_name, tool_args, channel_name);
+    maybe_inject_ask_user_recipient(tool_name, tool_args, channel_reply_target);
 
     if tool_name != "cron_add" {
         return;
@@ -343,6 +380,63 @@ mod tests {
         let mut args = serde_json::json!({ "question": "hi" });
         maybe_inject_originating_channel("ask_user", &mut args, "agent");
         assert!(args.get("channel").is_none());
+    }
+
+    #[test]
+    fn ask_user_on_channel_turn_gets_reply_target_as_recipient() {
+        // Channel turns have a real chat behind them: an empty-recipient
+        // question delivers nowhere (there is no CLI/ACP back-channel), which
+        // is how "the bot asked me nothing and hung" failures happen.
+        let mut args = serde_json::json!({ "question": "Are you coming to dinner?" });
+        maybe_inject_channel_delivery_defaults(
+            "ask_user",
+            &mut args,
+            "whatsapp",
+            Some("default"),
+            Some("207764949356757@lid"),
+        );
+        assert_eq!(args["recipient"], "207764949356757@lid");
+        assert_eq!(args["channel"], "whatsapp");
+    }
+
+    #[test]
+    fn ask_user_explicit_recipient_is_never_overridden() {
+        let mut args = serde_json::json!({
+            "question": "Are you coming to dinner?",
+            "recipient": "+6593826756@s.whatsapp.net",
+        });
+        maybe_inject_channel_delivery_defaults(
+            "ask_user",
+            &mut args,
+            "whatsapp",
+            Some("default"),
+            Some("207764949356757@lid"),
+        );
+        assert_eq!(args["recipient"], "+6593826756@s.whatsapp.net");
+    }
+
+    #[test]
+    fn ask_user_without_reply_target_keeps_back_channel_behavior() {
+        // CLI / ACP / RPC turns pass no reply target: the tool must keep its
+        // blocking back-channel semantics, so no recipient may be injected.
+        let mut args = serde_json::json!({ "question": "Proceed?" });
+        maybe_inject_channel_delivery_defaults("ask_user", &mut args, "cli", None, None);
+        assert!(args.get("recipient").is_none());
+    }
+
+    #[test]
+    fn non_ask_user_tools_never_get_recipient_injected() {
+        for tool in ["poll", "escalate_to_human", "cron_add", "shell"] {
+            let mut args = serde_json::json!({ "question": "x" });
+            maybe_inject_channel_delivery_defaults(
+                tool,
+                &mut args,
+                "whatsapp",
+                Some("default"),
+                Some("chat-9"),
+            );
+            assert!(args.get("recipient").is_none(), "tool={tool}");
+        }
     }
 
     #[test]
