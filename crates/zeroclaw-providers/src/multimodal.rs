@@ -1767,7 +1767,12 @@ pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDis
         .collect()
 }
 
-fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+/// The exact content a stale tool-result carrier delivers at dispatch: a
+/// declared carrier is replayed with its attachment list emptied at the fixed
+/// position (body verbatim), and every other carrier is delivered as its
+/// bytes. The token estimator prices stale carriers through this transform so
+/// the estimate tracks the delivered population, not the stored envelope.
+pub fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
     // A declared carrier empties its attachment list at the fixed position;
     // the body was never scanned, so it stays verbatim. Every other carrier
     // is legacy and is delivered as its bytes: nothing is stripped from it.
