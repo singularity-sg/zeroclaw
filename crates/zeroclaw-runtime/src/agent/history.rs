@@ -6,6 +6,7 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
 use zeroclaw_providers::multimodal::message_image_summary;
+use zeroclaw_providers::multimodal::strip_tool_result_image_markers;
 
 /// Default complete-turn retention limit. Prefer passing the config-driven
 /// value via `run_tool_call_loop`; this constant is only used when callers omit
@@ -188,8 +189,9 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 /// and a user message is charged for the loadable `[IMAGE:...]` markers
 /// preparation lifts. The per-image charge applies only when preparation
 /// dispatches the images ([`ImageMarkerDisposition::Normalized`]); stale
-/// tool-result carriers are priced as their bytes (the same formula as
-/// literal text; see the arm below), and system or assistant content
+/// tool-result carriers are priced at the replayed content — the emptied
+/// envelope plus verbatim body ([`strip_tool_result_image_markers`]; see the
+/// arm below) — and system or assistant content
 /// stays literal text. A message whose markers are all
 /// placeholders keeps the plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
@@ -206,13 +208,21 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
         ImageMarkerDisposition::Normalized => {
             summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        // A stale carrier is priced as its bytes: the replay delivers a
-        // legacy carrier verbatim and re-declares a declared one without
-        // touching its body, so the full content length is the price. (A
-        // stale declared envelope still carries its original attachment
-        // list in these bytes; that overcount is the accepted, conservative
-        // known limit.)
-        ImageMarkerDisposition::Stripped => text_estimate,
+        // A stale carrier is priced at the content the replay delivers: a
+        // declared carrier is replayed with its attachment list emptied at
+        // the fixed position and its body verbatim, and a legacy carrier is
+        // delivered as its bytes. Attachment payloads — normalized base64
+        // data URIs in particular — are lifted into image blocks or dropped,
+        // so they never reach the tokenizer as text; pricing the stored
+        // envelope here once projected ~400k tokens for a four-image
+        // history whose request measured ~67k.
+        ImageMarkerDisposition::Stripped => {
+            strip_tool_result_image_markers(message)
+                .content
+                .len()
+                .div_ceil(4)
+                + 4
+        }
         // Unreachable after the guard; keeps the arm total.
         ImageMarkerDisposition::Literal => text_estimate,
     }
@@ -681,6 +691,54 @@ mod tests {
             estimate_history_tokens(&history),
             expected,
             "a legacy carrier's body markers are text, never images"
+        );
+    }
+
+    #[test]
+    fn stale_declared_carrier_drops_attachment_payload_from_estimate() {
+        // A prepared tool-result carrier embeds its normalized attachments as
+        // base64 data URIs at the fixed position. While the carrier sits in
+        // the current user turn that costs one image charge per attachment;
+        // once a new user message arrives — the iteration-exhaustion summary
+        // prompt is appended to the prepared list exactly like this — the
+        // replay empties the attachment list and delivers the body verbatim,
+        // so the estimate must drop the payload with it. Pricing the stale
+        // carrier at its raw bytes made a four-image history project 400k
+        // tokens against a 131k window and refuse to dispatch.
+        let body = "rendered page text";
+        let payload = format!("data:image/png;base64,{}", "A".repeat(300_000));
+        let carrier = native_image_carrier(body, &[&payload]);
+        let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), carrier];
+        // Current turn: the attachment is charged per image, not per byte.
+        let expected_current = "u".len().div_ceil(4)
+            + 4
+            + "c".len().div_ceil(4)
+            + 4
+            + body.len().div_ceil(4)
+            + IMAGE_TOKEN_ESTIMATE
+            + 4;
+        assert_eq!(estimate_history_tokens(&history), expected_current);
+
+        history.push(ChatMessage::user("summarize"));
+        let stale = estimate_history_tokens(&history);
+        assert!(
+            stale < body.len().div_ceil(4) + 200,
+            "stale carrier priced its attachment payload as text: {stale}"
+        );
+
+        // The stale estimate must not scale with the attachment payload:
+        // the replay delivers the same emptied envelope and body either way.
+        let small_payload = format!("data:image/png;base64,{}", "A".repeat(64));
+        let mut small = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant("c"),
+            native_image_carrier(body, &[&small_payload]),
+        ];
+        small.push(ChatMessage::user("summarize"));
+        assert_eq!(
+            estimate_history_tokens(&small),
+            stale,
+            "stale pricing must not scale with attachment payload size"
         );
     }
 
