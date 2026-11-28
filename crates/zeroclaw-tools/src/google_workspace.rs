@@ -410,8 +410,19 @@ impl Tool for GoogleWorkspaceTool {
         let mut cmd = tokio::process::Command::new(gws_path);
         cmd.args(&cmd_args);
         cmd.env_clear();
-        // gws needs PATH to find itself and HOME/APPDATA for credential storage
-        for key in &["PATH", "HOME", "APPDATA", "USERPROFILE", "LANG", "TERM"] {
+        // gws needs PATH to find itself, HOME/APPDATA for credential storage,
+        // and USER: the macOS keychain lookup for its encrypted credentials is
+        // account-scoped, so without USER decryption fails and gws *deletes*
+        // the credentials file mid-call.
+        for key in &[
+            "PATH",
+            "HOME",
+            "APPDATA",
+            "USERPROFILE",
+            "LANG",
+            "TERM",
+            "USER",
+        ] {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
             }
